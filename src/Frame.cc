@@ -381,6 +381,122 @@ Frame::Frame(const cv::Mat &imGray, const double &timeStamp, ORBextractor* extra
     mpMutexImu = new std::mutex();
 }
 
+Frame::Frame(const cv::Mat& imGray, ORBextractor* extractor)
+{
+	mpORBextractorLeft = extractor;
+    // ORB extraction
+#ifdef REGISTER_TIMES
+    std::chrono::steady_clock::time_point time_StartExtORB = std::chrono::steady_clock::now();
+#endif
+
+    ExtractORB(0, imGray, 0, 1000);
+
+#ifdef REGISTER_TIMES
+    std::chrono::steady_clock::time_point time_EndExtORB = std::chrono::steady_clock::now();
+
+    mTimeORB_Ext = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(time_EndExtORB - time_StartExtORB).count();
+#endif
+}
+
+void Frame::completeFrame(const double& timeStamp, ORBextractor* extractor, ORBVocabulary* voc, GeometricCamera* pCamera, cv::Mat& distCoef, const float& bf, const float& thDepth, int imWidth, int imHeight, Frame* pPrevF, const IMU::Calib& ImuCalib)
+{
+    mpcpi = NULL;
+    mpORBvocabulary = voc;
+    mpORBextractorLeft = extractor;
+    mpORBextractorRight = static_cast<ORBextractor*>(NULL);
+    mTimeStamp = timeStamp;
+    mK = static_cast<Pinhole*>(pCamera)->toK();
+    mK_ = static_cast<Pinhole*>(pCamera)->toK_();
+    mDistCoef = distCoef.clone();
+    mbf = bf;
+    mThDepth = thDepth;
+    mImuCalib = ImuCalib;
+    mpImuPreintegrated = NULL;
+    mpPrevFrame = pPrevF;
+    mpImuPreintegratedFrame = NULL;
+    mpReferenceKF = static_cast<KeyFrame*>(NULL);
+    mbIsSet = false;
+    mbImuPreintegrated = false;
+    mpCamera = pCamera;
+    mpCamera2 = nullptr;
+    mbHasPose = false;
+    mbHasVelocity = false;
+
+
+    // Frame ID
+    mnId = nNextId++;
+
+    // Scale Level Info
+    mnScaleLevels = mpORBextractorLeft->GetLevels();
+    mfScaleFactor = mpORBextractorLeft->GetScaleFactor();
+    mfLogScaleFactor = log(mfScaleFactor);
+    mvScaleFactors = mpORBextractorLeft->GetScaleFactors();
+    mvInvScaleFactors = mpORBextractorLeft->GetInverseScaleFactors();
+    mvLevelSigma2 = mpORBextractorLeft->GetScaleSigmaSquares();
+    mvInvLevelSigma2 = mpORBextractorLeft->GetInverseScaleSigmaSquares();
+
+    N = mvKeys.size();
+    if (mvKeys.empty())
+        return;
+
+    UndistortKeyPoints();
+
+    // Set no stereo information
+    mvuRight = vector<float>(N, -1);
+    mvDepth = vector<float>(N, -1);
+    mnCloseMPs = 0;
+
+    mvpMapPoints = vector<MapPoint*>(N, static_cast<MapPoint*>(NULL));
+
+    mmProjectPoints.clear();// = map<long unsigned int, cv::Point2f>(N, static_cast<cv::Point2f>(NULL));
+    mmMatchedInImage.clear();
+
+    mvbOutlier = vector<bool>(N, false);
+
+	if(mbInitialComputations)
+    {
+        ComputeImageBounds(imWidth, imHeight);
+
+        mfGridElementWidthInv=static_cast<float>(FRAME_GRID_COLS)/static_cast<float>(mnMaxX-mnMinX);
+        mfGridElementHeightInv=static_cast<float>(FRAME_GRID_ROWS)/static_cast<float>(mnMaxY-mnMinY);
+
+        fx = static_cast<Pinhole*>(mpCamera)->toK().at<float>(0,0);
+        fy = static_cast<Pinhole*>(mpCamera)->toK().at<float>(1,1);
+        cx = static_cast<Pinhole*>(mpCamera)->toK().at<float>(0,2);
+        cy = static_cast<Pinhole*>(mpCamera)->toK().at<float>(1,2);
+        invfx = 1.0f/fx;
+        invfy = 1.0f/fy;
+
+        mbInitialComputations=false;
+    }
+
+    mb = mbf / fx;
+
+    //Set no stereo fisheye information
+    Nleft = -1;
+    Nright = -1;
+    mvLeftToRightMatch = vector<int>(0);
+    mvRightToLeftMatch = vector<int>(0);
+    mvStereo3Dpoints = vector<Eigen::Vector3f>(0);
+    monoLeft = -1;
+    monoRight = -1;
+
+    AssignFeaturesToGrid();
+
+    if (pPrevF)
+    {
+        if (pPrevF->HasVelocity())
+        {
+            SetVelocity(pPrevF->GetVelocity());
+        }
+    }
+    else
+    {
+        mVw.setZero();
+    }
+
+    mpMutexImu = new std::mutex();
+}
 
 void Frame::AssignFeaturesToGrid()
 {
@@ -788,11 +904,9 @@ void Frame::ComputeImageBounds(const cv::Mat &imLeft)
         mat.at<float>(1,0)=imLeft.cols; mat.at<float>(1,1)=0.0;
         mat.at<float>(2,0)=0.0; mat.at<float>(2,1)=imLeft.rows;
         mat.at<float>(3,0)=imLeft.cols; mat.at<float>(3,1)=imLeft.rows;
-
         mat=mat.reshape(2);
         cv::undistortPoints(mat,mat,static_cast<Pinhole*>(mpCamera)->toK(),mDistCoef,cv::Mat(),mK);
         mat=mat.reshape(1);
-
         // Undistort corners
         mnMinX = min(mat.at<float>(0,0),mat.at<float>(2,0));
         mnMaxX = max(mat.at<float>(1,0),mat.at<float>(3,0));
@@ -805,6 +919,33 @@ void Frame::ComputeImageBounds(const cv::Mat &imLeft)
         mnMaxX = imLeft.cols;
         mnMinY = 0.0f;
         mnMaxY = imLeft.rows;
+    }
+}
+
+void Frame::ComputeImageBounds(int width, int height)
+{
+    if(mDistCoef.at<float>(0)!=0.0)
+    {
+        cv::Mat mat(4,2,CV_32F);
+        mat.at<float>(0,0)=0.0; mat.at<float>(0,1)=0.0;
+        mat.at<float>(1,0)=width; mat.at<float>(1,1)=0.0;
+        mat.at<float>(2,0)=0.0; mat.at<float>(2,1)=height;
+        mat.at<float>(3,0)=width; mat.at<float>(3,1)=height;
+        mat=mat.reshape(2);
+        cv::undistortPoints(mat,mat,static_cast<Pinhole*>(mpCamera)->toK(),mDistCoef,cv::Mat(),mK);
+        mat=mat.reshape(1);
+        // Undistort corners
+        mnMinX = min(mat.at<float>(0,0),mat.at<float>(2,0));
+        mnMaxX = max(mat.at<float>(1,0),mat.at<float>(3,0));
+        mnMinY = min(mat.at<float>(0,1),mat.at<float>(1,1));
+        mnMaxY = max(mat.at<float>(2,1),mat.at<float>(3,1));
+    }
+    else
+    {
+        mnMinX = 0.0f;
+        mnMaxX = width;
+        mnMinY = 0.0f;
+        mnMaxY = height;
     }
 }
 
