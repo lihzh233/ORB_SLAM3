@@ -1,4 +1,5 @@
 # ORB-SLAM3
+I modified it for an end-cloud collaborative slam system with monocular model only. You can build it just like the original version. You can run the server by "./Examples/Monocular/mono_euroc_server ./Vocabulary/ORBvoc.txt ./Examples/Monocular/EuRoC.yaml". The client is in another repository named SLAMPlugin.
 
 ### V1.0, December 22th, 2021
 **Authors:** Carlos Campos, Richard Elvira, Juan J. Gómez Rodríguez, [José M. M. Montiel](http://webdiis.unizar.es/~josemari/), [Juan D. Tardos](http://webdiis.unizar.es/~jdtardos/).
